@@ -38,17 +38,25 @@ jobs:
       contains(github.event.pull_request.body, '**Automerge**: Enabled.')
     permissions:
       pull-requests: write
-    # Renovate's labels each fire their own `labeled` event, so collapse the near-simultaneous runs into one approval.
-    concurrency:
-      group: approve-pr-renovate-${{ github.repository }}-${{ github.event.pull_request.number }}
-      cancel-in-progress: true
+    # No concurrency group: Renovate only merges when every check run is success, skipped or neutral, so a
+    # cancelled duplicate run would block the merge forever. Each label fires its own run instead, and the
+    # step below skips approving again.
     steps:
       # Renovate can't approve its own PR, so main's required review would never be satisfied.
       - name: ✅ Approve renovate PR
         env:
           GITHUB_TOKEN: ${{ github.token }}
           PR_URL: ${{ github.event.pull_request.html_url }}
-        run: gh pr review --approve "$PR_URL"
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          approved=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/reviews" --paginate \
+            --jq '[.[] | select(.user.login == "github-actions[bot]" and .state == "APPROVED" and .commit_id == env.HEAD_SHA)] | length')
+          if [ "$approved" -gt 0 ]; then
+            echo "Already approved at $HEAD_SHA"
+          else
+            gh pr review --approve "$PR_URL"
+          fi
 
   # Update one PR per push to main: each merge puts the others behind again, so updating them all wastes CI.
   update-behind-renovate-prs:
