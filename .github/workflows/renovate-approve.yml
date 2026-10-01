@@ -1,0 +1,94 @@
+# Reusable workflow that supports Renovate auto-merging the PRs we've opted in to. Renovate does the merge
+# itself; this approves the PRs and keeps them up to date with main.
+#
+# To pause auto-merging everywhere, set RENOVATE_AUTOMERGE_PAUSED to `true`.
+# PRs that are already approved will still merge, so also set `automerge: false` in shared-renovate-config/default.json5.
+name: Auto-approve and update Renovate pull requests
+
+on:
+  workflow_call:
+    inputs:
+      renovate-actor:
+        description: The account Renovate opens PRs as
+        type: string
+        required: false
+        default: renovate[bot]
+      branch-prefix:
+        description: The branch prefix Renovate uses
+        type: string
+        required: false
+        default: renovate/
+    secrets:
+      RENOVATE_GITHUB_TOKEN:
+        # Only used by update-behind-renovate-prs, which only runs on pushes to main.
+        required: false
+
+jobs:
+  approve-pr-renovate:
+    runs-on: ubuntu-latest
+    # Only act on Renovate's own changes, not hand-added labels or edits.
+    # Labels are unioned across a group but automerge requires every package to allow it, so also check the
+    # description. Mixed groups are left for a human.
+    if: >-
+      github.event_name == 'pull_request' &&
+      vars.RENOVATE_AUTOMERGE_PAUSED != 'true' &&
+      github.actor == inputs.renovate-actor &&
+      startsWith(github.head_ref, inputs.branch-prefix) &&
+      contains(github.event.pull_request.labels.*.name, 'automerge') &&
+      contains(github.event.pull_request.body, '**Automerge**: Enabled.')
+    permissions:
+      pull-requests: write
+    # Renovate's labels each fire their own `labeled` event, so collapse the near-simultaneous runs into one approval.
+    concurrency:
+      group: approve-pr-renovate-${{ github.repository }}-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    steps:
+      # Renovate can't approve its own PR, so main's required review would never be satisfied.
+      - name: ✅ Approve renovate PR
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+        run: gh pr review --approve "$PR_URL"
+
+  # Update one PR per push to main: each merge puts the others behind again, so updating them all wastes CI.
+  update-behind-renovate-prs:
+    if: >-
+      github.event_name == 'push' &&
+      vars.RENOVATE_AUTOMERGE_PAUSED != 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    # Pushes to main can land close together, so serialise runs rather than letting two of them
+    # race to update-branch the same PR at the same time.
+    concurrency:
+      group: update-behind-renovate-prs-${{ github.repository }}
+      cancel-in-progress: false
+    steps:
+      - name: 🔄 Update the next Renovate automerge branch
+        env:
+          # Use our own token rather than GITHUB_TOKEN: GitHub deliberately doesn't trigger
+          # workflows from actions performed by GITHUB_TOKEN, so the required checks on the
+          # updated branch would never run.
+          GITHUB_TOKEN: ${{ secrets.RENOVATE_GITHUB_TOKEN }}
+          BRANCH_PREFIX: ${{ inputs.branch-prefix }}
+        # Oldest approved automerge PR first. Skip PRs with failed required checks (only required ones: some
+        # repos have jobs that always fail on PRs). mergeStateStatus is skipped because it's often UNKNOWN
+        # right after a push, and every PR is behind anyway. Renovate's next run catches anything left over.
+        run: |
+          gh pr list --repo "$GITHUB_REPOSITORY" --label automerge --state open \
+            --json number,headRefName,reviewDecision,createdAt \
+            --jq '[.[] | select(.headRefName | startswith(env.BRANCH_PREFIX)) | select(.reviewDecision == "APPROVED")]
+              | sort_by(.createdAt) | .[].number' |
+          while read -r pr; do
+            # Repos with no required checks make gh exit non-zero, which counts as nothing failing.
+            failed=$(gh pr checks "$pr" --repo "$GITHUB_REPOSITORY" --required --json bucket \
+              --jq 'any(.[]; .bucket == "fail" or .bucket == "cancel")' 2>/dev/null || echo false)
+            if [ "$failed" = "true" ]; then
+              echo "Skipping #$pr: required checks failed"
+              continue
+            fi
+            if gh pr update-branch "$pr" --repo "$GITHUB_REPOSITORY"; then
+              echo "Updated #$pr"
+              break
+            fi
+          done

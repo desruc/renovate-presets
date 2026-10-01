@@ -1,0 +1,30 @@
+name: Validate Renovate presets
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - shared-renovate-config/**
+      - renovate-config.js
+      - .github/workflows/validate-renovate-config.yml
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 📥 Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Every repo picks up a change here on its next Renovate run, so catch invalid or deprecated config before it merges.
+      # Renovate keeps this version in step with renovate-version in renovate.yml (see renovate-config.js).
+      - name: ✅ Validate presets
+        run: npx --yes --package renovate@44.115.13 -- renovate-config-validator --strict shared-renovate-config/default.json5 shared-renovate-config/github-action.json5 shared-renovate-config/dotnet.json5
+
+      - name: ✅ Validate this repo's config
+        env:
+          RENOVATE_CONFIG_FILE: renovate-config.js
+        run: npx --yes --package renovate@44.115.13 -- renovate-config-validator --strict
